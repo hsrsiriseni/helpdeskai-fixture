@@ -2,8 +2,8 @@
 
 POST /v1/kb/documents — upload a document to the caller's tenant KB.
 
-This router uses the SECURE authentication path: get_current_tenant() verifies
-the JWT signature and extracts tenant_id from the verified payload (CTRL-AUTH-001).
+Tenant identity comes from get_current_tenant(), which verifies the JWT
+signature and extracts tenant_id from the verified payload.
 """
 
 from __future__ import annotations
@@ -30,9 +30,6 @@ router = APIRouter()
 )
 async def upload_kb_document(
     body: KBUploadRequest,
-    # SECURITY FIXTURE: CTRL-AUTH-001 — this route correctly uses get_current_tenant,
-    # which verifies the JWT signature and extracts tenant_id from the verified payload.
-    # Contrast with /v1/chat which reads the raw X-Tenant-Id header (VULN-MT-002).
     tenant: TokenPayload = Depends(get_current_tenant),
 ) -> KBUploadResponse:
     """Upload a document to the authenticated tenant's knowledge base.
@@ -78,12 +75,15 @@ async def get_kb_document_url(
     document_key: str,
     tenant: TokenPayload = Depends(get_current_tenant),
 ) -> dict:
-    """Generate a presigned URL for a KB document.
-
-    NOTE: The underlying S3Client.get_document_url() has a 7-day expiry and
-    does not enforce per-tenant key scoping (VULN-DATA-004). That vulnerability
-    is in the data layer, not here — this route at least verifies the JWT.
-    """
+    """Generate a short-lived presigned URL for one of the tenant's KB documents."""
     client = S3Client()
-    url = client.get_document_url(document_key=document_key)
+    try:
+        url = client.get_document_url(
+            tenant_id=tenant.tenant_id, document_key=document_key
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Document key is outside the caller's tenant scope.",
+        ) from exc
     return {"url": url, "document_key": document_key}

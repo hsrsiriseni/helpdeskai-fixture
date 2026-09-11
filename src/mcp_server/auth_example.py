@@ -1,15 +1,8 @@
 """
-Authentication middleware example — POSITIVE CONTROL reference.
+API key authentication for MCP tool calls.
 
-This module shows what a correctly authenticated MCP server looks like.
-It is NOT wired into server.py (the deliberately insecure fixture server).
-Its presence in the codebase allows Trent to surface the contrast:
-"A secure auth pattern exists in the codebase but is not deployed."
-
-POSITIVE CONTROL: CTRL-APP-001
-
-In a production MCP server, this middleware would be composed into the
-server startup to require a valid API key on every tool call.
+Wired into server.py: every exposed tool carries @require_api_key, so a caller
+must present the key whose SHA-256 digest is in MCP_API_KEY_HASH.
 """
 
 import hashlib
@@ -26,12 +19,8 @@ class ApiKeyAuthMiddleware:
       MCP_API_KEY_HASH (env var): SHA-256 hex digest of the valid API key.
         Set this instead of the raw key so the key is never in the environment.
 
-    Usage (hypothetical FastMCP extension — not yet part of the FastMCP API):
-        mcp = FastMCP("fixture-mcp", middleware=[ApiKeyAuthMiddleware()])
-
-    Alternative for stdio transport: wrap each tool function with
-    require_api_key() and pass the key via a shared secret in the startup
-    environment rather than on-the-wire.
+    Each tool function is wrapped with require_api_key(); the key travels in the
+    tool call's arguments and is compared against the stored digest.
     """
 
     def __init__(self) -> None:
@@ -49,33 +38,12 @@ class ApiKeyAuthMiddleware:
 
 
 def require_api_key(tool_func: Callable) -> Callable:
-    """Decorator: reject tool calls that do not carry a valid API key.
-
-    The key is expected in the tool call's metadata under 'x-api-key'.
-    This is a reference implementation; the exact integration point depends
-    on the MCP server framework version.
-    """
-    _middleware = ApiKeyAuthMiddleware()
+    """Decorator: reject tool calls that do not carry a valid API key."""
 
     @wraps(tool_func)
     def wrapper(*args, api_key: str = "", **kwargs):
-        if not _middleware.validate(api_key):
+        if not ApiKeyAuthMiddleware().validate(api_key):
             raise PermissionError("Invalid or missing API key for MCP tool call.")
         return tool_func(*args, **kwargs)
 
     return wrapper
-
-
-# Example of a correctly authenticated tool (for contrast with server.py):
-#
-# @mcp.tool()
-# @require_api_key
-# def execute_code_authenticated(code: str, api_key: str = "") -> str:
-#     ...
-#     exec(code, {}, local_vars)
-#     ...
-#
-# Note: exec() is still fundamentally dangerous even with auth; the correct
-# fix for VULN-APP-004 is to replace exec() with a restricted interpreter
-# (e.g., RestrictedPython) or to redesign the tool to not accept raw code.
-# Auth is a necessary but insufficient control for an exec()-based tool.

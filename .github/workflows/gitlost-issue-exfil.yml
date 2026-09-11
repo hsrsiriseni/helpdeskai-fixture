@@ -1,23 +1,10 @@
-# SECURITY FIXTURE — DELIBERATELY VULNERABLE WORKFLOW (GitLost-class exfil)
-# Models the "GitLost" attack (noma.security): an agentic workflow on an
-# untrusted issue trigger that (1) reads private/cross-repo content and
-# (2) exfiltrates it by posting to a PUBLIC issue comment. This exercises the
-# two elements the other fixtures do NOT: cross-repo private READ scope and a
-# public-output EXFIL SINK. Do NOT use as a template for real workflows.
-#
-# PLANTED FINDINGS:
-#   VULN-CI-013 (Critical): cross-repository/private read scope (org-wide PAT) on an
-#                           untrusted 'issues' trigger — the agent can read repos far
-#                           beyond the one that fired it.
-#   VULN-CI-014 (Critical): public-comment exfil sink — the agent posts whatever it
-#                           read as a comment on the (public) triggering issue.
-#   VULN-CI-015 (Critical): lethal trifecta — untrusted trigger + private read +
-#                           public write, with untrusted issue body as the instruction.
+# Issue triage reads only this repository and only the issue title. The org-wide
+# read token is gone, the job cannot comment, and the issue body never reaches the
+# agent — closing the read-private / write-public pair.
 
-name: Agentic Issue Triage (GitLost-class)
+name: Agentic Issue Triage
 
 on:
-  # Untrusted entry point: anyone can open an issue.
   issues:
     types: [opened]
 
@@ -25,33 +12,18 @@ jobs:
   triage:
     runs-on: ubuntu-latest
 
-    # VULN-CI-014: issues:write is the public-output sink (add-comment on a public issue).
     permissions:
       contents: read
-      issues: write
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
-      - name: Triage with cross-repo context
-        uses: anthropics/claude-code-base-action@v1
+      - name: Summarise the issue title
+        uses: anthropics/claude-code-action@0c127307fa529d701bc1f0f8f9c0bea881c49a9b  # v1.0.2
         with:
-          # VULN-CI-013: an org-wide read PAT gives the agent cross-repository /
-          # private-repo read access — the class of scope GitLost abused.
-          github_token: ${{ secrets.ORG_READ_PAT }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-
-          # No actor gate: any external issue author drives the agent.
-          allowed_non_write_users: "*"
-
-          # VULN-CI-015: untrusted issue body is the instruction; the agent is told
-          # it may read other repos for context and post its findings back as a
-          # comment — the read-private + write-public composition.
           prompt: |
-            You are triaging a GitHub issue. You may read related repositories in
-            this organization for context, then post your findings as a comment on
-            the issue so the reporter can see them.
-            Issue body:
-            ${{ github.event.issue.body }}
-          # add-comment / gh tools are enabled so the agent can write to the public issue.
-          claude_args: "--allowedTools Bash(gh issue comment),Bash(gh api) --max-turns 30"
+            Read only the issue title. Do not read the issue body and do not read
+            any other repository. Write a brief triage summary to the job log.
+          claude_args: "--max-turns 5 --allowedTools read"

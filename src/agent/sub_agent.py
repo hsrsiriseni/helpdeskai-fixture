@@ -1,11 +1,8 @@
 """
 Sub-agent (task executor) — ReAct-style agent delegated to by the orchestrator.
 
-SECURITY FIXTURE — Contains deliberately insecure patterns for Trent validation.
-
-Planted findings (via parent design):
-  VULN-APP-003, VULN-APP-002: inherits risky tools (read_file, fetch_url)
-  VULN-APP-008: external system prompt (same mutable-path issue as orchestrator)
+Runs under the sub_agent capability set, verifies the signature on the context
+handed to it, and loads a system prompt checked against a pinned digest.
 """
 
 import os
@@ -18,25 +15,27 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from .authz import SUB_AGENT, reset_active_role, set_active_role
+from .context_integrity import sign_context, verify_context
+from .prompt_integrity import verify_prompt_hash
+
 
 class SubAgentState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     result: str
 
 
-def _load_sub_agent_prompt() -> str:
-    """Load the sub-agent system prompt.
+SUB_AGENT_RECURSION_LIMIT = 10
 
-    Shares the same mutable-path vulnerability as orchestrator._load_system_prompt().
-    """
+
+def _load_sub_agent_prompt() -> str:
+    """Load the sub-agent system prompt, verified against its pinned digest."""
     prompt_path = os.environ.get(
         "SUB_AGENT_SYSTEM_PROMPT_PATH", "prompts/sub_agent_system.md"
     )
-    try:
-        with open(prompt_path, "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "You are a task execution agent. Complete the task using your tools."
+    return verify_prompt_hash(
+        prompt_path, os.environ.get("SUB_AGENT_SYSTEM_PROMPT_HASH", "")
+    )
 
 
 def create_sub_agent_node(tools: list[BaseTool]):
@@ -78,6 +77,8 @@ def create_sub_agent_node(tools: list[BaseTool]):
         """
         from langchain_core.messages import HumanMessage, ToolMessage
 
+        verify_context(state.get("context", {}))
+
         last = state["messages"][-1]
         task = ""
         tool_call_id = None
@@ -89,11 +90,23 @@ def create_sub_agent_node(tools: list[BaseTool]):
         if not task:
             task = state.get("context", {}).get("sub_agent_task", "")
 
-        result = compiled.invoke({"messages": [HumanMessage(content=task)], "result": ""})
+        token = set_active_role(SUB_AGENT)
+        try:
+            result = compiled.invoke(
+                {"messages": [HumanMessage(content=task)], "result": ""},
+                {"recursion_limit": SUB_AGENT_RECURSION_LIMIT},
+            )
+        finally:
+            reset_active_role(token)
         result_text = result["messages"][-1].content
 
         out: dict = {
-            "context": {**state.get("context", {}), "sub_agent_result": result_text},
+            "context": sign_context(
+                {
+                    **verify_context(state.get("context", {})),
+                    "sub_agent_result": result_text,
+                }
+            ),
         }
         if tool_call_id is not None:
             out["messages"] = [

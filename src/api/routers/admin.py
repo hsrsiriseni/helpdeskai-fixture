@@ -1,8 +1,7 @@
 """Admin route handlers for HelpDeskAI.
 
-These routes are intended for internal use only but are exposed without
-proper authorization controls — any authenticated user (regardless of role)
-can access them.
+These routes are internal: the caller must present a verified JWT carrying the
+admin role, checked before any tenant data is read.
 """
 
 from __future__ import annotations
@@ -53,29 +52,18 @@ def _verify_token(token: str) -> dict[str, Any]:
 async def list_all_tenants(
     token: str = Depends(oauth2_scheme),
 ) -> list[TenantInfo]:
-    """List all tenants registered in the system.
-
-    # SECURITY FIXTURE: VULN-AUTH-002 — this admin route has NO authorization
-    # check beyond a valid JWT signature. Any authenticated caller (any tenant,
-    # any role) can invoke this endpoint and receive a full listing of every
-    # tenant in the system — including tenant IDs, names, and plan tiers.
-    #
-    # The missing control is a role check such as:
-    #   if payload.get("role") != "admin":
-    #       raise HTTPException(status_code=403, detail="Admin role required.")
-    #
-    # Without it, a support agent, a trial customer, or a compromised service
-    # account can enumerate all tenants and use that information to target
-    # cross-tenant attacks (e.g., combining with VULN-MT-001 / VULN-MT-002).
-    """
+    """List all tenants registered in the system. Requires the admin role."""
     payload = _verify_token(token)
-    # BUG: role is decoded from the JWT but never checked.
-    _role = payload.get("role", "user")  # VULN-AUTH-002: decoded but not enforced
+
+    if payload.get("role", "user") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required to enumerate tenants.",
+        )
 
     dynamodb = boto3.resource("dynamodb", region_name=_AWS_REGION)
     table = dynamodb.Table(_TENANT_TABLE)
 
-    # Scan the entire tenant config table — returns all tenants.
     response = table.scan(
         ProjectionExpression="tenant_id, #n, plan, created_at",
         ExpressionAttributeNames={"#n": "name"},

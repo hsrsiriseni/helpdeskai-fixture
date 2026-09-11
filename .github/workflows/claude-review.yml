@@ -1,52 +1,30 @@
-# SECURITY FIXTURE — DELIBERATELY VULNERABLE WORKFLOW
-# This file is a test fixture for Trent's agentic deployment automation posture
-# analysis. It contains deliberately planted vulnerabilities. Do NOT use this
-# as a template for real workflows.
-#
-# PLANTED FINDINGS:
-#   VULN-CI-001: pull_request_target + checkout of PR head + agent execution
-#   VULN-CI-007: contents: write permission allows agent to modify workflow files
-#   VULN-CI-005 (partial): anthropics/claude-code-action@v1 is a floating tag
+# Reviews run on the `pull_request` trigger, so a fork PR gets a read-only token
+# and no access to base-repo secrets. The agent may comment on the PR; it cannot
+# write repository contents or modify workflows.
 
 name: Claude Code PR Review
 
 on:
-  # VULN-CI-001: pull_request_target runs in the base repo context, with base-repo
-  # secrets and GITHUB_TOKEN. When combined with a checkout of the PR head below,
-  # attacker-controlled code from the fork executes with elevated privileges.
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened]
 
 jobs:
   claude-review:
     runs-on: ubuntu-latest
 
-    # VULN-CI-007: contents: write means Claude Code can write to .github/workflows/
-    # and modify its own workflow — a workflow self-modification vector.
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
-      issues: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
-          # VULN-CI-001 (continued): Checking out the PR head ref of a fork PR means
-          # the agent reads and executes attacker-controlled files (e.g., skill files
-          # in .claude/skills/ that Claude Code loads at startup).
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Run Claude Code review
-        # VULN-CI-005: Floating tag @v1 — not pinned to a commit SHA.
-        # A supply-chain compromise of anthropics/claude-code-action could replace
-        # this tag with malicious code that exfiltrates GITHUB_TOKEN and secrets.
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@0c127307fa529d701bc1f0f8f9c0bea881c49a9b  # v1.0.2
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # The @claude trigger phrase means any PR commenter can invoke the agent.
           trigger_phrase: "@claude"
-          # Claude Code will read .claude/skills/ from the checked-out head — which
-          # is the attacker's version of those files when the PR is from a fork.
-          claude_args: "--max-turns 20"
+          claude_args: "--max-turns 20 --allowedTools read,list_files"

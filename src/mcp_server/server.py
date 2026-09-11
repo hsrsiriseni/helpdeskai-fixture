@@ -1,12 +1,10 @@
 """
 MCP server — exposes tools to any MCP-compatible host agent (e.g., the orchestrator).
 
-SECURITY FIXTURE — Contains deliberately insecure patterns for Trent validation.
-
-Planted findings:
-  VULN-APP-004: execute_code — arbitrary Python code execution via exec()
-  VULN-APP-005: query_database — SQL injection via f-string interpolation
-  VULN-APP-006: No authentication on the MCP server — any host can connect
+Every tool requires the caller to present the API key whose SHA-256 digest is in
+MCP_API_KEY_HASH (see auth_example.ApiKeyAuthMiddleware). Database access is
+restricted to allowlisted tables and columns with the filter value bound as a
+query parameter.
 
 Server name: fixture-mcp
 Transport: stdio (for local use) or SSE (for network use)
@@ -17,63 +15,56 @@ To start:
 The MCP client configuration is in server_config.json.
 """
 
+import os
 import sqlite3
 
 from mcp.server.fastmcp import FastMCP
 
-# VULN-APP-006: The MCP server is initialized with no authentication requirement.
-# Any process that can spawn or connect to this server can invoke its tools
-# (execute arbitrary code, run arbitrary SQL queries) without credentials.
+from src.mcp_server.auth_example import require_api_key
+
+ALLOWED_TABLES = {"orders", "customers", "tickets"}
+ALLOWED_COLUMNS = {"order_id", "customer_id", "ticket_id", "tenant_id", "status"}
+MAX_FILTER_VALUE_LENGTH = 255
+
+_DB_PATH = os.environ.get("MCP_DB_PATH", "data.db")
+
 mcp = FastMCP("fixture-mcp")
 
 
 @mcp.tool()
-def execute_code(code: str) -> str:
-    """Execute a Python code snippet and return the result.
+@require_api_key
+def query_database(
+    table: str,
+    filter_column: str,
+    filter_value: str,
+    api_key: str = "",
+) -> list[dict]:
+    """Query a record from an allowlisted table by filtering on an allowlisted column.
 
-    This tool is provided for data analysis tasks. The caller supplies
-    Python source code which is executed in the server process.
-
-    Args:
-        code: Python source code to execute.
-
-    Returns:
-        String representation of the execution result, or error message.
-    """
-    # VULN-APP-004: exec() executes caller-supplied code in the server process.
-    # There is no sandbox, no restricted globals, no resource limit, and no
-    # allowlist of safe operations. A caller can read files, make network requests,
-    # spawn subprocesses, or exfiltrate environment variables (including secrets).
-    local_vars: dict = {}
-    try:
-        exec(code, {}, local_vars)  # noqa: S102
-        return str(local_vars.get("result", "Code executed (no 'result' variable set)"))
-    except Exception as exc:
-        return f"Error: {exc}"
-
-
-@mcp.tool()
-def query_database(table: str, filter_column: str, filter_value: str) -> list[dict]:
-    """Query a record from the database by filtering on a column value.
+    Requires an `api_key` matching the digest in MCP_API_KEY_HASH.
 
     Args:
-        table: Name of the table to query.
-        filter_column: Name of the column to filter on.
+        table: Name of the table to query. Must be in ALLOWED_TABLES.
+        filter_column: Name of the column to filter on. Must be in ALLOWED_COLUMNS.
         filter_value: Value to match in the filter column.
+        api_key: Caller credential.
 
     Returns:
         List of matching rows as dicts.
     """
-    conn = sqlite3.connect("data.db")
+    if table not in ALLOWED_TABLES:
+        raise ValueError(f"Table {table!r} is not queryable.")
+    if filter_column not in ALLOWED_COLUMNS:
+        raise ValueError(f"Column {filter_column!r} is not filterable.")
+    if len(filter_value) > MAX_FILTER_VALUE_LENGTH:
+        raise ValueError("filter_value exceeds the maximum permitted length.")
+
+    conn = sqlite3.connect(_DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # VULN-APP-005: SQL query built by f-string interpolation. An attacker can
-    # supply filter_value="' OR '1'='1" to dump the entire table, or a more
-    # sophisticated payload to exfiltrate other tables or call sqlite functions.
-    # Correct pattern: parameterized query with cursor.execute(sql, (value,)).
-    sql = f"SELECT * FROM {table} WHERE {filter_column} = '{filter_value}'"  # noqa: S608
-    cursor.execute(sql)
+    sql = f"SELECT * FROM {table} WHERE {filter_column} = ?"  # noqa: S608
+    cursor.execute(sql, (filter_value,))
     rows = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return rows

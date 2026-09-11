@@ -1,22 +1,11 @@
-# SECURITY FIXTURE — DELIBERATELY VULNERABLE WORKFLOW (vendor-default overrides)
-# This file is a test fixture for Trent's agentic deployment automation posture
-# analysis. Every planted issue here is a DEVIATION FROM A VENDOR-DOCUMENTED SAFE
-# DEFAULT of anthropics/claude-code-action (see its docs/security.md). The posture
-# rubric must catch these *because* they override a safe default — not because the
-# generic risk exists. Do NOT use this as a template for real workflows.
-#
-# PLANTED FINDINGS:
-#   VULN-CI-008 (Critical): allowed_non_write_users: '*' bypasses the write-access gate
-#   VULN-CI-009 (High):     allowed_bots: '*' lets any GitHub App invoke with its own prompt
-#   VULN-CI-010 (High):     show_full_output: true leaks tool output / secrets in public logs
-#   VULN-CI-011 (Medium):   CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: 0 disables secret scrubbing
-#   VULN-CI-012 (High):     uses claude-code-base-action (no actor permission checks) on an
-#                           untrusted trigger, with a static PAT as github_token
+# Issue triage on the vendor defaults: the write-access actor gate and bot gate are
+# left in place, subprocess secret scrubbing stays on, output is not echoed to the
+# public log, and the job-scoped GITHUB_TOKEN is used rather than a static PAT.
+# The prompt is fixed here; the issue body never enters it.
 
-name: Claude Triage (insecure overrides)
+name: Claude Triage
 
 on:
-  # Untrusted entry point: anyone can open an issue on a public repo.
   issues:
     types: [opened]
 
@@ -24,46 +13,22 @@ jobs:
   triage:
     runs-on: ubuntu-latest
 
-    # VULN-CI-003-style broad permissions paired with the overrides below.
     permissions:
-      contents: write
+      contents: read
       issues: write
-      pull-requests: write
-
-    env:
-      # VULN-CI-011: opting OUT of the action's subprocess secret-scrubbing. The
-      # security doc credits scrubbing as a defense when non-write users are allowed;
-      # disabling it removes that mitigation.
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0"
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Triage the issue
-        # VULN-CI-012: claude-code-base-action is the lower-level building block that,
-        # per the security doc, "does not perform actor permission checks". Using it on
-        # an untrusted 'issues' trigger removes the write-access gate entirely.
-        uses: anthropics/claude-code-base-action@v1
+        uses: anthropics/claude-code-action@0c127307fa529d701bc1f0f8f9c0bea881c49a9b  # v1.0.2
         with:
-          # VULN-CI-012 (continued): a static PAT instead of ${{ secrets.GITHUB_TOKEN }}.
-          # The doc warns a static token "does not rotate between runs and could be
-          # recovered via prompt injection".
-          github_token: ${{ secrets.ADMIN_PAT }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-
-          # VULN-CI-008: '*' bypasses the default write-access-only trigger gate — any
-          # user, including a first-time external issue author, can drive the agent.
-          allowed_non_write_users: "*"
-
-          # VULN-CI-009: '*' lets ANY GitHub App (including one created by an attacker on
-          # a public repo) invoke the action "with a prompt it controls".
-          allowed_bots: "*"
-
-          # VULN-CI-010: full output is publicly visible in Actions logs on public repos
-          # and may include tool outputs, file contents, and credentials.
-          show_full_output: "true"
-
-          # Untrusted issue body flows straight into the prompt (cicd.untrusted-input),
-          # compounding the bypassed actor gate above.
-          prompt: "Triage this issue and apply fixes:\n${{ github.event.issue.body }}"
-          claude_args: "--max-turns 30"
+          show_full_output: "false"
+          prompt: |
+            Automatically triage newly opened issues by: (1) reading the issue title
+            and labels, (2) assigning a triage label (bug/feature/question), and
+            (3) adding a comment with next steps. Do not make code changes and do
+            not run shell commands.
+          claude_args: "--max-turns 10 --allowedTools read"

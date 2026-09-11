@@ -1,15 +1,9 @@
-# SECURITY FIXTURE — DELIBERATELY VULNERABLE INFRASTRUCTURE-AS-CODE
-# This Terraform defines the AWS backbone for HelpDeskAI. It contains deliberately
-# planted cloud/storage/IAM misconfigurations for Trent's threat-model analysis to
-# detect, alongside one positive control for contrast. Do NOT use as a template.
+# Infrastructure for HelpDeskAI: KB and attachment storage, the orders database,
+# the tickets/tenant-config tables, and the ECS task role.
 #
-# PLANTED FINDINGS:
-#   VULN-DATA-003 (High):     KB bucket is public-read and has no server-side encryption
-#   VULN-CLOUD-001 (Critical): IAM policy grants s3:* and dynamodb:* on Resource "*"
-#   VULN-CLOUD-002 (High):     hardcoded AWS access key / secret in the provider block
-#   VULN-CLOUD-003 (Medium):   RDS instance with storage_encrypted = false (no KMS)
-# POSITIVE CONTROLS:
-#   CTRL-CLOUD-001: attachments bucket enforces SSE-KMS + full public-access block
+# Credentials are never declared here — the provider resolves them from the
+# environment or an assumed role (OIDC in CI). State lives in an encrypted,
+# versioned S3 backend.
 
 terraform {
   required_providers {
@@ -18,49 +12,83 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  backend "s3" {
+    bucket       = "helpdeskai-terraform-state"
+    key          = "infra/main.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
 }
 
-# SECURITY FIXTURE: VULN-CLOUD-002 — static, long-lived AWS credentials hardcoded
-# directly in the provider block (and committed to the repo). These should come from
-# an assumed role / OIDC / environment, never be checked in. A leaked repo leaks the
-# keys; the CI coding agents (see .github/workflows) run with repo access and could
-# read these via prompt injection (see cross-surface CHAIN-2 in EXPECTED_FINDINGS.md).
 provider "aws" {
-  region     = "us-east-1"
-  access_key = "AKIAIOSFODNN7EXAMPLE"                         # VULN-CLOUD-002
-  secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"     # VULN-CLOUD-002
+  region = "us-east-1"
+}
+
+variable "vpc_id" {
+  description = "VPC hosting the ECS tasks and the orders database."
+  type        = string
+}
+
+variable "private_subnet_ids" {
+  description = "Private subnets for the orders database subnet group."
+  type        = list(string)
+}
+
+variable "orders_db_secret_arn" {
+  description = "Secrets Manager secret holding the orders database credentials."
+  type        = string
+}
+
+data "aws_secretsmanager_secret_version" "orders_db" {
+  secret_id = var.orders_db_secret_arn
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Knowledge-base bucket — INSECURE (VULN-DATA-003)
+# Knowledge-base bucket
 # ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_kms_key" "kb_docs" {
+  description             = "CMK for HelpDeskAI knowledge base documents"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+}
+
+resource "aws_kms_alias" "kb_docs" {
+  name          = "alias/helpdeskai-kb-docs"
+  target_key_id = aws_kms_key.kb_docs.key_id
+}
 
 resource "aws_s3_bucket" "kb_docs" {
   bucket = "helpdeskai-kb-docs"
 }
 
-# SECURITY FIXTURE: VULN-DATA-003 — public-read ACL on the KB bucket. Any anonymous
-# internet user can list and download every tenant's knowledge-base documents.
 resource "aws_s3_bucket_acl" "kb_docs" {
   bucket = aws_s3_bucket.kb_docs.id
-  acl    = "public-read" # VULN-DATA-003
+  acl    = "private"
 }
 
-# SECURITY FIXTURE: VULN-DATA-003 — public access block explicitly DISABLED, so the
-# public-read ACL above takes effect (no account/bucket guard rail).
 resource "aws_s3_bucket_public_access_block" "kb_docs" {
   bucket                  = aws_s3_bucket.kb_docs.id
-  block_public_acls       = false # VULN-DATA-003
-  block_public_policy     = false # VULN-DATA-003
-  ignore_public_acls      = false # VULN-DATA-003
-  restrict_public_buckets = false # VULN-DATA-003
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
 }
 
-# NOTE the ABSENCE of an aws_s3_bucket_server_side_encryption_configuration for
-# kb_docs — VULN-DATA-003: KB documents are stored unencrypted at rest.
+resource "aws_s3_bucket_server_side_encryption_configuration" "kb_docs" {
+  bucket = aws_s3_bucket.kb_docs.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.kb_docs.arn
+    }
+  }
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Attachments bucket — SECURE (CTRL-CLOUD-001)
+# Attachments bucket
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_kms_key" "attachments" {
@@ -73,8 +101,6 @@ resource "aws_s3_bucket" "attachments" {
   bucket = "helpdeskai-attachments"
 }
 
-# SECURITY FIXTURE: CTRL-CLOUD-001 — attachments bucket enforces SSE-KMS at rest with
-# a customer-managed key. Contrast with the KB bucket (VULN-DATA-003).
 resource "aws_s3_bucket_server_side_encryption_configuration" "attachments" {
   bucket = aws_s3_bucket.attachments.id
   rule {
@@ -85,7 +111,6 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "attachments" {
   }
 }
 
-# SECURITY FIXTURE: CTRL-CLOUD-001 — full public-access block on the attachments bucket.
 resource "aws_s3_bucket_public_access_block" "attachments" {
   bucket                  = aws_s3_bucket.attachments.id
   block_public_acls       = true
@@ -98,11 +123,26 @@ resource "aws_s3_bucket_public_access_block" "attachments" {
 # DynamoDB + RDS data stores
 # ─────────────────────────────────────────────────────────────────────────────
 
+resource "aws_kms_key" "tables" {
+  description             = "CMK for HelpDeskAI DynamoDB tables"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+}
+
 resource "aws_dynamodb_table" "tickets" {
   name         = "helpdeskAI-tickets"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "tenant_id"
   range_key    = "ticket_id"
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.tables.arn
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
 
   attribute {
     name = "tenant_id"
@@ -114,23 +154,97 @@ resource "aws_dynamodb_table" "tickets" {
   }
 }
 
-# SECURITY FIXTURE: VULN-CLOUD-003 — RDS instance holding customer orders + PII with
-# storage_encrypted = false: no encryption at rest, no KMS. PII (see VULN-DATA-002)
-# sits unencrypted on disk and in snapshots.
+resource "aws_dynamodb_table" "tenant_config" {
+  name         = "helpdeskAI-tenant-config"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "tenant_id"
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = aws_kms_key.tables.arn
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  attribute {
+    name = "tenant_id"
+    type = "S"
+  }
+}
+
+resource "aws_kms_key" "orders" {
+  description             = "CMK for the HelpDeskAI orders database"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+}
+
+resource "aws_kms_alias" "orders" {
+  name          = "alias/helpdeskai-orders"
+  target_key_id = aws_kms_key.orders.key_id
+}
+
+resource "aws_security_group" "app" {
+  name        = "helpdeskai-app"
+  description = "ECS tasks running the HelpDeskAI service"
+  vpc_id      = var.vpc_id
+}
+
+resource "aws_security_group" "orders_db" {
+  name        = "helpdeskai-orders-db"
+  description = "Orders database; reachable only from the application tasks"
+  vpc_id      = var.vpc_id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "orders_db_from_app" {
+  security_group_id            = aws_security_group.orders_db.id
+  referenced_security_group_id = aws_security_group.app.id
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+}
+
+resource "aws_db_subnet_group" "orders" {
+  name       = "helpdeskai-orders"
+  subnet_ids = var.private_subnet_ids
+}
+
 resource "aws_db_instance" "orders" {
-  identifier        = "helpdeskai-orders"
-  engine            = "postgres"
-  instance_class    = "db.t3.medium"
-  allocated_storage = 50
-  username          = "helpdeskAI_app"
-  password          = "changeme" # also weak/committed, compounds VULN-CLOUD-002
-  storage_encrypted = false      # VULN-CLOUD-003
-  publicly_accessible = true     # VULN-CLOUD-003: DB reachable from the internet
-  skip_final_snapshot = true
+  identifier             = "helpdeskai-orders"
+  engine                 = "postgres"
+  instance_class         = "db.t3.medium"
+  allocated_storage      = 50
+  username               = jsondecode(data.aws_secretsmanager_secret_version.orders_db.secret_string)["username"]
+  password               = jsondecode(data.aws_secretsmanager_secret_version.orders_db.secret_string)["password"]
+  storage_encrypted      = true
+  kms_key_id             = aws_kms_key.orders.arn
+  publicly_accessible    = false
+  db_subnet_group_name   = aws_db_subnet_group.orders.name
+  vpc_security_group_ids = [aws_security_group.orders_db.id]
+  backup_retention_period = 7
+  skip_final_snapshot     = false
+  final_snapshot_identifier = "helpdeskai-orders-final"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IAM role for the application — OVER-PERMISSIONED (VULN-CLOUD-001)
+# Application logs
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_kms_key" "logs" {
+  description             = "CMK for HelpDeskAI CloudWatch log groups"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+}
+
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/helpdeskai/app"
+  retention_in_days = 365
+  kms_key_id        = aws_kms_key.logs.arn
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IAM role for the application
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "app" {
@@ -145,21 +259,48 @@ resource "aws_iam_role" "app" {
   })
 }
 
-# SECURITY FIXTURE: VULN-CLOUD-001 — the application role is granted s3:* and
-# dynamodb:* on Resource "*". A compromise of the app (e.g. via the agent's RCE
-# tool, or a CI agent reading these creds) yields full read/write/delete over EVERY
-# bucket and table in the account, across all tenants. The least-privilege version
-# would scope actions to the specific buckets/tables and to GetObject/PutObject /
-# Query/PutItem only.
 resource "aws_iam_role_policy" "app" {
   name = "helpdeskai-app-policy"
   role = aws_iam_role.app.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:*", "dynamodb:*"] # VULN-CLOUD-001
-      Resource = "*"                    # VULN-CLOUD-001
-    }]
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject"]
+        Resource = [
+          "${aws_s3_bucket.kb_docs.arn}/*",
+          "${aws_s3_bucket.attachments.arn}/*",
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = [aws_s3_bucket.kb_docs.arn, aws_s3_bucket.attachments.arn]
+      },
+      {
+        Effect = "Allow"
+        Action = ["dynamodb:Query", "dynamodb:PutItem", "dynamodb:GetItem"]
+        Resource = [
+          aws_dynamodb_table.tickets.arn,
+          aws_dynamodb_table.tenant_config.arn,
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [var.orders_db_secret_arn]
+      },
+      {
+        Effect = "Allow"
+        Action = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Resource = [
+          aws_kms_key.kb_docs.arn,
+          aws_kms_key.attachments.arn,
+          aws_kms_key.tables.arn,
+          aws_kms_key.orders.arn,
+        ]
+      },
+    ]
   })
 }

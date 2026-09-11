@@ -1,81 +1,117 @@
 """
-Basic unit tests for the MCP server tools.
+Unit tests for the MCP server tools.
 
-These tests verify the tool function behavior without an MCP runtime.
-They also document the security contract (or lack thereof) for each tool.
+These verify the tool function behaviour without an MCP runtime, and assert the
+security contract each tool now carries: authentication on every call, and
+allowlisted table/column names with the filter value bound as a parameter.
 """
 
-import pytest
-import sqlite3
+import hashlib
 import os
+import sqlite3
 import tempfile
 
+import pytest
 
-def test_execute_code_basic():
-    """Verify execute_code runs Python and captures the result variable."""
-    from src.mcp_server.server import execute_code
-    output = execute_code(code="result = 1 + 1")
-    assert output == "2"
+API_KEY = "test-api-key-12345"
 
 
-def test_execute_code_error_returns_message():
-    """Verify execute_code returns error messages rather than raising."""
-    from src.mcp_server.server import execute_code
-    output = execute_code(code="raise ValueError('test error')")
-    assert "Error" in output
-    assert "test error" in output
+@pytest.fixture()
+def api_key(monkeypatch):
+    monkeypatch.setenv(
+        "MCP_API_KEY_HASH", hashlib.sha256(API_KEY.encode()).hexdigest()
+    )
+    return API_KEY
 
 
-def test_execute_code_no_sandbox():
-    """
-    Fixture verification: execute_code does NOT sandbox the provided code.
-    This test documents VULN-APP-004 by demonstrating that os.environ is
-    accessible from within execute_code — i.e., there is no restricted globals.
-    """
-    from src.mcp_server.server import execute_code
-    # Set a dummy env var and verify execute_code can read it.
-    os.environ["FIXTURE_TEST_SECRET"] = "plaintext-value"
-    output = execute_code(code="import os; result = os.environ.get('FIXTURE_TEST_SECRET')")
-    assert output == "plaintext-value"
-    del os.environ["FIXTURE_TEST_SECRET"]
-
-
-def test_query_database_basic():
-    """Verify query_database returns rows from the database."""
-    from src.mcp_server.server import query_database
-
-    # Create a temporary database for the test.
+@pytest.fixture()
+def seeded_db(monkeypatch):
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE users (id INTEGER, name TEXT)")
-    conn.execute("INSERT INTO users VALUES (1, 'Alice')")
+    conn.execute("CREATE TABLE orders (order_id TEXT, status TEXT)")
+    conn.execute("INSERT INTO orders VALUES ('ord-1', 'shipped')")
     conn.commit()
     conn.close()
 
-    # Patch the server's database path.
-    original_connect = sqlite3.connect
-    import unittest.mock as mock
-    with mock.patch("sqlite3.connect", return_value=sqlite3.connect(db_path)):
-        rows = query_database(table="users", filter_column="name", filter_value="Alice")
-    assert len(rows) == 1
-    assert rows[0]["name"] == "Alice"
-
+    monkeypatch.setattr("src.mcp_server.server._DB_PATH", db_path)
+    yield db_path
     os.unlink(db_path)
 
 
-def test_auth_example_validates_key():
+def test_execute_code_tool_is_not_exposed():
+    """The arbitrary-code-execution tool is no longer part of the server."""
+    from src.mcp_server import server
+
+    assert not hasattr(server, "execute_code")
+
+
+def test_query_database_returns_rows_for_authenticated_caller(api_key, seeded_db):
+    from src.mcp_server.server import query_database
+
+    rows = query_database(
+        table="orders",
+        filter_column="order_id",
+        filter_value="ord-1",
+        api_key=api_key,
+    )
+    assert len(rows) == 1
+    assert rows[0]["status"] == "shipped"
+
+
+def test_query_database_rejects_missing_api_key(api_key, seeded_db):
+    from src.mcp_server.server import query_database
+
+    with pytest.raises(PermissionError):
+        query_database(
+            table="orders", filter_column="order_id", filter_value="ord-1"
+        )
+
+
+def test_query_database_rejects_unlisted_table(api_key, seeded_db):
+    from src.mcp_server.server import query_database
+
+    with pytest.raises(ValueError):
+        query_database(
+            table="sqlite_master",
+            filter_column="order_id",
+            filter_value="ord-1",
+            api_key=api_key,
+        )
+
+
+def test_query_database_rejects_unlisted_column(api_key, seeded_db):
+    from src.mcp_server.server import query_database
+
+    with pytest.raises(ValueError):
+        query_database(
+            table="orders",
+            filter_column="status) OR (1=1",
+            filter_value="x",
+            api_key=api_key,
+        )
+
+
+def test_query_database_binds_filter_value(api_key, seeded_db):
+    """A classic injection payload is matched literally, not interpreted."""
+    from src.mcp_server.server import query_database
+
+    rows = query_database(
+        table="orders",
+        filter_column="order_id",
+        filter_value="' OR '1'='1",
+        api_key=api_key,
+    )
+    assert rows == []
+
+
+def test_auth_example_validates_key(monkeypatch):
     """Verify the auth middleware correctly validates API keys."""
-    import hashlib
     from src.mcp_server.auth_example import ApiKeyAuthMiddleware
 
-    test_key = "test-api-key-12345"
-    key_hash = hashlib.sha256(test_key.encode()).hexdigest()
-    os.environ["MCP_API_KEY_HASH"] = key_hash
+    monkeypatch.setenv("MCP_API_KEY_HASH", hashlib.sha256(API_KEY.encode()).hexdigest())
 
     middleware = ApiKeyAuthMiddleware()
-    assert middleware.validate(test_key) is True
+    assert middleware.validate(API_KEY) is True
     assert middleware.validate("wrong-key") is False
-
-    del os.environ["MCP_API_KEY_HASH"]

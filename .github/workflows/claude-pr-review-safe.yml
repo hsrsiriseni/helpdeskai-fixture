@@ -45,7 +45,7 @@ jobs:
         # CTRL-CI-002: Action pinned to a full commit SHA, not a floating tag.
         # The comment documents the version for human readers while the SHA
         # prevents silent tag replacement.
-        uses: anthropics/claude-code-action@ad3c35f9e03e073624b484e68eb8ba9183cef1b8  # v1.0.2
+        uses: anthropics/claude-code-action@0c127307fa529d701bc1f0f8f9c0bea881c49a9b  # v1.0.2
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           trigger_phrase: "@claude"

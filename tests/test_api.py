@@ -28,16 +28,39 @@ def test_routes_registered():
     assert "/v1/admin/tenants" in paths
 
 
-def test_orchestrator_factory_returns_invokable():
+def test_orchestrator_factory_returns_invokable(monkeypatch):
     """create_orchestrator returns an Orchestrator exposing invoke(message, tenant_id, thread_id).
 
     We assert the surface without calling it (calling would require live Anthropic creds).
     """
-    import os
+    import hashlib
 
-    os.environ.setdefault("ANTHROPIC_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    with open("prompts/orchestrator_system.md", "rb") as handle:
+        monkeypatch.setenv(
+            "AGENT_SYSTEM_PROMPT_HASH", hashlib.sha256(handle.read()).hexdigest()
+        )
+    with open("prompts/sub_agent_system.md", "rb") as handle:
+        monkeypatch.setenv(
+            "SUB_AGENT_SYSTEM_PROMPT_HASH", hashlib.sha256(handle.read()).hexdigest()
+        )
+
     from src.agent.orchestrator import create_orchestrator, Orchestrator
 
     orch = create_orchestrator()
     assert isinstance(orch, Orchestrator)
     assert hasattr(orch, "invoke")
+
+
+def test_orchestrator_factory_refuses_unpinned_prompt(monkeypatch):
+    """A system prompt with no pinned digest fails loudly rather than loading."""
+    import pytest
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    monkeypatch.delenv("AGENT_SYSTEM_PROMPT_HASH", raising=False)
+
+    from src.agent.orchestrator import create_orchestrator
+    from src.agent.prompt_integrity import PromptIntegrityError
+
+    with pytest.raises(PromptIntegrityError):
+        create_orchestrator()
