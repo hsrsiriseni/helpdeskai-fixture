@@ -101,3 +101,5 @@ poetry run pytest tests/ -v
 ## Security
 
 Remediation of the Trent scan findings landed in commit 4dd0e30. Remaining manual controls (branch protection, GitHub environments, OIDC roles) are tracked in the Trent project.
+
+Last validated: 2026-09-11.
